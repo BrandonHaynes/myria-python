@@ -1,7 +1,8 @@
 """ Utilities for generating Myria plans """
 
 from functools import partial
-import jsonpath_rw as jsonpath
+from itertools import chain
+import jmespath
 
 DEFAULT_SCAN_TYPE = 'FileScan'
 DEFAULT_INSERT_TYPE = 'DbInsert'
@@ -9,86 +10,132 @@ DEFAULT_INSERT_TYPE = 'DbInsert'
 
 class MyriaPlan(object):
     expressions = {
-        'fragments': jsonpath.parse('$.plan.fragments.[*]'),
-        'operators': jsonpath.parse('$.plan.fragments.[*].operators.[*]')
+        'type': jmespath.compile('plan.type || plan.body.type'),
+        'subplans': jmespath.compile('plan.plans[] || plans[] || plan.body[] || body[]'),
+        'fragments': jmespath.compile('plan.fragments[] || fragments[]'),
+        'fragment-list': jmespath.compile('plan.fragments || fragments'),
+        'operators': jmespath.compile('plan.fragments[].operators[]'),
+        'shuffles': jmespath.compile('plan.fragments[].operators[?contains(opType, `Shuffle`)][contains(opType, `Producer`)]')
         }
 
-    def __init__(self, json):
-        self.json = json
+    def __init__(self, data, parent=None):
+        self.parent = parent
+        self.data = data
 
     @property
     def type(self):
-        return self.json['plan']['type']
+        return self.expressions['type'].search(self.data)
 
     @property
     def language(self):
-        return self.json['language']
+        return self.data['language']
 
     @property
     def profiling_mode(self):
-        return self.json['profilingMode']
+        return self.data['profilingMode']
 
     @property
     def text(self):
-        return self.json['rawQuery']
+        return self.data['rawQuery']
 
     @property
     def logicalRa(self):
-        return self.json['logicalRa']
+        return self.data['logicalRa']
 
     @property
-    def fragments(self):
-        return (MyriaFragment(f.value, f.path, f.context, self) for f in self.expressions['fragments'].find(self.json))
+    def root(self):
+        return self.parent.root if self.parent else self
 
     @property
-    def operators(self):
-        return (MyriaOperator(o.value, o.path, o.context, self) for o in self.expressions['operators'].find(self.json))
+    def subplans(self):
+        return (MyriaPlan(subplan, parent=self) for subplan in self.expressions['subplans'].search(self.data) or [])
+
+    @property
+    def fragments(self, descendants=True):
+        return chain((MyriaFragment(self, fragment) for fragment in self.expressions['fragments'].search(self.data) or []),
+                     (fragment for subplan in self.subplans for fragment in subplan.fragments) if descendants else [])
+
+    @property
+    def operators(self, descendants=True):
+        return chain((operator for fragment in self.fragments for operator in fragment.operators),
+                     (operator for subplan in self.subplans for operator in subplan.operators) if descendants else [])
+
+    @property
+    def shuffles(self):
+        return (operator for fragment in self.fragments for operator in fragment.shuffles)
+
+    def search(self, path):
+        return jmespath.search(path, self.data)
+
+    @property
+    def _fragment_list(self):
+        return self.expressions['fragment-list'].search(self.data)
 
     def __str__(self):
-        return "MyriaPlan(%s)" % (self.text or self.json)
+        return "MyriaPlan(%s)" % (self.text or self.data)
 
     def __repr__(self):
         return self.__str__()
 
 
-class MyriaFragment(jsonpath.DatumInContext):
+class MyriaFragment(object):
     expressions = {
-        'operators': jsonpath.parse('`this`.operators[*]')
+        'operators': jmespath.compile('operators[]'),
+        'operator-list': jmespath.compile('operators'),
+        'shuffles': jmespath.compile('operators[?contains(opType, `ShuffleProducer`)]')
         }
 
-    def __init__(self, value, path=None, context=None, plan=None):
-        super(MyriaFragment, self).__init__(value, path, context)
+    def __init__(self, plan, data):
         self.plan = plan
+        self.data = data
 
     @property
     def workers(self):
-        return self.value['overrideWorkers']
+        return self.data.get('overrideWorkers', None)
 
     @property
     def operators(self):
-        return (MyriaOperator(o.value, o.path, o.context, self.plan) for o in self.expressions['operators'].find(self))
+        return (MyriaOperator(self, operator) for operator in self.expressions['operators'].search(self.data))
+
+    @property
+    def shuffles(self):
+        return (MyriaOperator(self, operator) for operator in self.expressions['shuffles'].search(self.data))
+
+    def merge(self, other, force=False):
+        if self.workers != other.workers and not force:
+            raise Exception('change me')
+        self._operator_list.extend(other._operator_list)
+        other.plan._fragment_list.remove(other.data)
+        other.plan, other.data = self.plan, self.data
+
+    @property
+    def _operator_list(self):
+        return self.expressions['operator-list'].search(self.data)
 
 
-class MyriaOperator(jsonpath.DatumInContext):
-    def __init__(self, value, path=None, context=None, plan=None):
-        super(MyriaOperator, self).__init__(value, path, context)
-        self.plan = plan
+class MyriaOperator(object):
+    REMOVABLE_OPERATORS = ['ShuffleProducer', 'ShuffleConsumer']
+    CHILD_ARGUMENT_PREFIXES = ['argChild', 'argOperatorId']
+
+    def __init__(self, fragment, data):
+        self.fragment = fragment
+        self.data = data
 
     @property
     def id(self):
-        return self.value['opId']
+        return self.data['opId']
 
     @property
     def name(self):
-        return self.value['opName']
+        return self.data['opName']
 
     @property
     def type(self):
-        return self.value['opType']
+        return self.data['opType']
 
     @property
-    def fragment(self):
-        return self.context.context
+    def plan(self):
+        return self.fragment.plan
 
     @property
     def parent(self):
@@ -99,25 +146,66 @@ class MyriaOperator(jsonpath.DatumInContext):
     @property
     def children(self):
         return (op for op in self.plan.operators
-                   if op.id in self._child_ids)
+                   if op.id in self._child_ids.values())
 
     @property
     def _child_ids(self):
         # Is this better than explicitly enumerating child attribute names?
-        return (value for key, value in self.items()
-                      if 'CHILD' in key.upper() and
-                         isinstance(value, int))
+        return {key: value for key, value in self.items()
+                    if any(token in key for token in self.CHILD_ARGUMENT_PREFIXES) and
+                       isinstance(value, int)}
 
-    def add(self, key, value): self.value.add(key, value)
-    def items(self): return self.value.items()
-    def keys(self): return self.value.keys()
-    def values(self): return self.value.values()
-    def __len__(self): return len(self.value)
-    def __iter__(self): return self.value.__iter__()
-    def __getitem__(self, item): return self.value[item]
-    def __setitem__(self, item, value): self.value[item] = value
-    def __delitem__(self, key): del self.value[key]
-    def __contains__(self, item): return self.value.contains(item)
+    def remove(self, force=False):
+        if len(self._child_ids) > 1:
+            raise Exception('change type')
+        elif self.type not in self.REMOVABLE_OPERATORS and not force:
+            raise Exception('change' + self.type)
+        else:
+            key = (key for key, value in self.parent._child_ids.items() if value == self.id).next()
+            self.parent[key] = self.children.next().id
+            self.fragment._operator_list.remove(self.data)
+            self.fragment = None
+
+    def add(self, key, value): self.data.add(key, value)
+    def items(self): return self.data.items()
+    def keys(self): return self.data.keys()
+    def values(self): return self.data.values()
+    def __len__(self): return len(self.data)
+    def __iter__(self): return self.data.__iter__()
+    def __getitem__(self, item): return self.data[item]
+    def __setitem__(self, item, value): self.data[item] = value
+    def __delitem__(self, key): del self.data[key]
+    def __contains__(self, item): return self.data.contains(item)
+
+    def __str__(self):
+        return "<myria.plans.MyriaOperator(%s: %s)>" % (self.type, self.name)
+
+    def __repr__(self):
+        return self.__str__()
+
+
+def remove_shuffle(producer):
+    consumer = producer.parent
+
+    if 'ShuffleProducer' not in producer.type:
+        raise Exception('asdf')
+    elif consumer is None or 'ShuffleConsumer' not in consumer.type:
+        raise Exception('asdf')
+
+    _remove_merge(producer)
+
+
+def _remove_merge(child, parent=None):
+    parent = parent or child.parent
+
+    if parent is None:
+        raise Exception('asdf')
+    elif parent.fragment.workers != child.fragment.workers:
+        raise Exception('asdf')
+
+    parent.fragment.merge(child.fragment)
+    child.remove()
+    parent.remove()
 
 
 def get_parallel_import_plan(schema, work, relation, text='',
